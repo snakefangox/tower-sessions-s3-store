@@ -1,0 +1,10 @@
+[package]
+name = "tower-sessions-s3-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.92"
+rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }
+serde-zap = "0.1.1"
+tower-sessions = "0.15.0"
