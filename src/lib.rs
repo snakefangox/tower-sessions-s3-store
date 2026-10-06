@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use moka::future::Cache;
 use s3::{Bucket, error::S3Error};
 use tower_sessions::{
-    CachingSessionStore, MemoryStore, SessionStore,
+    SessionStore,
     session::{Id, Record},
     session_store::{self, Error},
 };
@@ -10,32 +11,33 @@ use tower_sessions::{
 pub struct S3SessionStore {
     session_path: String,
     client: Box<Bucket>,
+    cache: Cache<Id, Record>,
 }
 
 impl S3SessionStore {
-    pub fn new(
-        client: Box<Bucket>,
-        session_path: Option<String>,
-    ) -> CachingSessionStore<MemoryStore, Self> {
-        let cache = MemoryStore::default();
+    /// Setup a session store backed by an S3 bucket
+    /// Bundled with a cache because S3 is slow
+    pub fn new(client: Box<Bucket>, cache_limit: u64, session_path: Option<String>) -> Self {
         let session_path = session_path.unwrap_or_else(|| "/sessions".to_string());
-        let store = Self {
+        let cache = Cache::new(cache_limit);
+
+        Self {
             session_path,
             client,
-        };
-
-        CachingSessionStore::new(cache, store)
+            cache,
+        }
     }
 }
 
 #[async_trait]
 impl SessionStore for S3SessionStore {
     async fn create(&self, session_record: &mut Record) -> session_store::Result<()> {
-        while self
-            .client
-            .object_exists(&make_path(&self.session_path, &session_record.id))
-            .await
-            .map_err(backend_err)?
+        while self.cache.contains_key(&session_record.id)
+            || self
+                .client
+                .object_exists(&make_path(&self.session_path, &session_record.id))
+                .await
+                .map_err(backend_err)?
         {
             session_record.id = Id::default();
         }
@@ -44,6 +46,9 @@ impl SessionStore for S3SessionStore {
     }
 
     async fn save(&self, session_record: &Record) -> session_store::Result<()> {
+        self.cache
+            .insert(session_record.id, session_record.clone())
+            .await;
         let bytes = serde_zap::to_vec(&session_record).map_err(|e| Error::Encode(e.to_string()))?;
         self.client
             .put_object(make_path(&self.session_path, &session_record.id), &bytes)
@@ -54,6 +59,10 @@ impl SessionStore for S3SessionStore {
     }
 
     async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
+        if let Some(session) = self.cache.get(session_id).await {
+            return Ok(Some(session));
+        }
+
         let res = self
             .client
             .get_object(make_path(&self.session_path, &session_id))
@@ -70,6 +79,7 @@ impl SessionStore for S3SessionStore {
     }
 
     async fn delete(&self, session_id: &Id) -> session_store::Result<()> {
+        self.cache.remove(session_id).await;
         self.client
             .delete_object(make_path(&self.session_path, session_id))
             .await
